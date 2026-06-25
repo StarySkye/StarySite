@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cinematic Sky · Fading Clouds</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1a2a3a;
+    }
+    #skyCanvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: radial-gradient(ellipse at 50% 70%, #6a8fa8, #1f3d52);
+      cursor: default;
+    }
+    .ground {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      width: 100%;
+      height: 12vh;
+      background: linear-gradient(0deg, rgba(10, 15, 10, 0.5) 0%, transparent 100%);
+      pointer-events: none;
+      z-index: 2;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="skyCanvas"></canvas>
+  <div class="ground"></div>
+
+  <script>
+    (function() {
+      const canvas = document.getElementById('skyCanvas');
+      const ctx = canvas.getContext('2d');
+
+      let W, H;
+
+      function resize() {
+        W = canvas.width = window.innerWidth;
+        H = canvas.height = window.innerHeight;
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      const daySky = new Image();
+      const nightSky = new Image();
+      daySky.src = 'light.png';
+      nightSky.src = 'night.png';
+
+      // --------------------------------------------------------------
+      //  UTILITY
+      // --------------------------------------------------------------
+      function rand(min, max) { return min + Math.random() * (max - min); }
+
+      function clamp(v, mn, mx) { return Math.max(mn, Math.min(mx, v)); }
+      function lerp(a, b, t) { return a + (b - a) * t; }
+
+      // deterministic noise using seed
+      function seededRandom(seed) {
+        return function() {
+          seed = (seed * 9301 + 49297) % 233280;
+          return seed / 233280;
+        };
+      }
+
+      // --------------------------------------------------------------
+      //  CLOUD BLOB GENERATOR – fluffy cumulus (with precomputed colors)
+      // --------------------------------------------------------------
+      function generateCloudBlobs(cx, cy, scale = 1, seed = 0, gloom = 0) {
+        const count = 45 + Math.floor(Math.random() * 35);
+        const blobs = [];
+        const rng = seededRandom(seed || 12345);
+
+        const xSpread = 140 * scale;
+        const ySpread = 75 * scale;
+
+        for (let i = 0; i < count; i++) {
+          const angle = rng() * Math.PI * 2;
+          let dist = Math.pow(rng(), 0.6) * 1.3;
+          if (rng() < 0.1) dist = 0.7 + rng() * 0.9;
+
+          const xOff = Math.cos(angle) * dist * xSpread;
+          const yOff = Math.sin(angle) * dist * ySpread * 0.6;
+
+          const centerBias = 1 - Math.min(1, dist * 0.9);
+          const baseR = (18 + rng() * 48) * scale;
+          const r = baseR * (0.5 + 0.5 * centerBias);
+
+          const alpha = (0.4 + rng() * 0.5) * (0.6 + 0.4 * centerBias);
+
+          // precompute color offsets (warmth) – no randomness per frame
+          const warmth = -0.2 + rng() * 0.4;
+
+          blobs.push({
+            x: cx + xOff,
+            y: cy + yOff,
+            r: Math.max(4, r),
+            alpha: Math.min(0.92, Math.max(0.15, alpha)),
+            warmth: warmth,
+            // precompute base color variation (will be combined later)
+            baseR_offset: Math.floor(rng() * 20 - 10),
+            baseG_offset: Math.floor(rng() * 20 - 10),
+            baseB_offset: Math.floor(rng() * 20 - 10),
+          });
+        }
+
+        blobs.sort((a, b) => b.r - a.r);
+        return blobs;
+      }
+
+      // --------------------------------------------------------------
+      //  CLOUD CLASS – with fading opacity over time
+      // --------------------------------------------------------------
+      class Cloud {
+        constructor(options = {}) {
+          this.x = options.x ?? rand(-W * 0.3, W * 1.3);
+          this.y = options.y ?? rand(0.02 * H, 0.70 * H);
+          this.scale = options.scale ?? rand(0.5, 1.6);
+          this.speed = options.speed ?? rand(0.08, 0.50);
+          this.depth = options.depth ?? rand(0.1, 0.9);
+
+          this.seed = options.seed ?? rand(0, 99999);
+          this.gloom = options.gloom ?? rand(0, 0.5); // 0=bright, 1=dark/grey
+
+          // generate blobs once
+          this.blobs = generateCloudBlobs(0, 0, this.scale, this.seed, this.gloom);
+
+          // vertical bob
+          this.phase = rand(0, Math.PI * 2);
+          this.bobAmp = rand(1.5, 5);
+          this.bobSpeed = rand(0.002, 0.007);
+          this.baseY = this.y;
+
+          // fading: each cloud has a base opacity that slowly oscillates
+          this.baseOpacity = rand(0.6, 1.0);
+          this.fadePhase = rand(0, Math.PI * 2);
+          this.fadeSpeed = rand(0.0008, 0.003); // very slow
+          this.fadeAmp = rand(0.2, 0.5);
+
+          // store current opacity for drawing
+          this.currentOpacity = this.baseOpacity;
+
+          // color palette (base white/grey)
+          this.colorBase = {
+            r: 230 + rand(-15, 15) - this.gloom * 60,
+            g: 230 + rand(-15, 15) - this.gloom * 55,
+            b: 235 + rand(-15, 15) - this.gloom * 50,
+          };
+          // clamp
+          this.colorBase.r = clamp(this.colorBase.r, 130, 255);
+          this.colorBase.g = clamp(this.colorBase.g, 130, 255);
+          this.colorBase.b = clamp(this.colorBase.b, 140, 255);
+        }
+
+        update(time) {
+          // horizontal drift
+          this.x += this.speed;
+          if (this.x > W + 350 * this.scale) {
+            this.x = -350 * this.scale;
+            this.baseY = rand(0.02 * H, 0.70 * H);
+            this.y = this.baseY;
+            // refresh blobs for variety
+            this.seed += 777;
+            this.blobs = generateCloudBlobs(0, 0, this.scale, this.seed, this.gloom);
+          }
+
+          // bob
+          this.phase += this.bobSpeed;
+          this.y = this.baseY + Math.sin(this.phase) * this.bobAmp;
+
+          // fade in/out slowly
+          this.fadePhase += this.fadeSpeed;
+          const fadeFactor = 0.5 + 0.5 * Math.sin(this.fadePhase);
+          this.currentOpacity = this.baseOpacity * (0.3 + 0.7 * fadeFactor);
+        }
+
+        draw(ctx, time, globalOvercast = false) {
+          const opacity = this.currentOpacity * (globalOvercast ? 0.7 : 1.0);
+          if (opacity < 0.02) return;
+
+          const base = this.colorBase;
+          const isOvercast = globalOvercast || this.gloom > 0.3;
+
+          for (const blob of this.blobs) {
+            const px = this.x + blob.x;
+            const py = this.y + blob.y;
+            const r = blob.r;
+            const alpha = blob.alpha * opacity;
+
+            // slight per-blob color variation
+            const r2 = clamp(base.r + blob.baseR_offset + blob.warmth * 10, 130, 255);
+            const g2 = clamp(base.g + blob.baseG_offset + blob.warmth * 5, 130, 255);
+            const b2 = clamp(base.b + blob.baseB_offset - blob.warmth * 8, 130, 255);
+
+            const grad = ctx.createRadialGradient(
+              px - r * 0.2, py - r * 0.25, r * 0.05,
+              px, py, r
+            );
+
+            const innerA = Math.min(0.95, alpha * 1.2);
+            grad.addColorStop(0, `rgba(${r2},${g2},${b2},${innerA})`);
+            grad.addColorStop(0.45, `rgba(${r2-6},${g2-4},${b2-3},${alpha * 0.9})`);
+            grad.addColorStop(0.85, `rgba(${r2-18},${g2-14},${b2-12},${alpha * 0.4})`);
+            grad.addColorStop(1, `rgba(${r2-30},${g2-25},${b2-20},0)`);
+
+            ctx.beginPath();
+            ctx.arc(px, py, r, 0, Math.PI * 2);
+            ctx.fillStyle = grad;
+            ctx.fill();
+
+            // subtle highlight
+            if (r > 18 * this.scale && alpha > 0.3) {
+              const hl = ctx.createRadialGradient(
+                px - r * 0.3, py - r * 0.35, r * 0.02,
+                px - r * 0.15, py - r * 0.2, r * 0.5
+              );
+              const hlA = (isOvercast ? 0.04 : 0.15) * alpha;
+              hl.addColorStop(0, `rgba(255,255,255,${hlA})`);
+              hl.addColorStop(1, `rgba(255,255,255,0)`);
+              ctx.beginPath();
+              ctx.arc(px, py, r, 0, Math.PI * 2);
+              ctx.fillStyle = hl;
+              ctx.fill();
+            }
+          }
+
+          // soft shadow underneath
+          if (this.depth > 0.5 && this.scale > 0.5) {
+            const sy = this.y + 20 * this.scale;
+            const sw = 130 * this.scale;
+            const grad = ctx.createRadialGradient(
+              this.x, sy, 5,
+              this.x, sy, sw
+            );
+            const shadowA = (isOvercast ? 0.03 : 0.02) * opacity;
+            grad.addColorStop(0, `rgba(0,0,10,${shadowA})`);
+            grad.addColorStop(1, `rgba(0,0,10,0)`);
+            ctx.beginPath();
+            ctx.ellipse(this.x, sy, sw, sw * 0.2, 0, 0, Math.PI * 2);
+            ctx.fillStyle = grad;
+            ctx.fill();
+          }
+        }
+      }
+
+      // --------------------------------------------------------------
+      //  CREATE CLOUD LAYERS
+      // --------------------------------------------------------------
+
+      // 1. Overcast layer (stratus-like) – large, spread out, grey
+      const overcastClouds = [];
+      for (let i = 0; i < 8; i++) {
+        const depth = rand(0.05, 0.30);
+        const scale = rand(1.8, 3.2);
+        const speed = rand(0.03, 0.14);
+        const x = rand(-W * 0.6, W * 1.6);
+        const y = rand(0.0 * H, 0.45 * H);
+        const c = new Cloud({
+          x,
+          y,
+          scale,
+          speed,
+          depth,
+          gloom: rand(0.5, 0.85),
+          seed: rand(0, 99999),
+          baseOpacity: rand(0.5, 0.9),
+          fadeSpeed: rand(0.0004, 0.0015),
+        });
+        overcastClouds.push(c);
+      }
+      overcastClouds.sort((a, b) => a.depth - b.depth);
+
+      // 2. Mid cumulus – fluffy, moderate size
+      const midClouds = [];
+      for (let i = 0; i < 12; i++) {
+        const depth = rand(0.25, 0.65);
+        const scale = rand(0.7, 1.8);
+        const speed = rand(0.08, 0.35);
+        const x = rand(-W * 0.3, W * 1.3);
+        const y = rand(0.03 * H, 0.65 * H);
+        const c = new Cloud({
+          x,
+          y,
+          scale,
+          speed,
+          depth,
+          gloom: rand(0, 0.35),
+          seed: rand(0, 99999),
+          baseOpacity: rand(0.7, 1.0),
+          fadeSpeed: rand(0.0006, 0.0025),
+        });
+        midClouds.push(c);
+      }
+      midClouds.sort((a, b) => a.depth - b.depth);
+
+      // 3. Foreground fluffy cumulus – large, bright, detailed
+      const foregroundClouds = [];
+      for (let i = 0; i < 6; i++) {
+        const depth = rand(0.6, 0.95);
+        const scale = rand(1.2, 2.2);
+        const speed = rand(0.15, 0.50);
+        const x = rand(-W * 0.2, W * 1.2);
+        const y = rand(0.10 * H, 0.60 * H);
+        const c = new Cloud({
+          x,
+          y,
+          scale,
+          speed,
+          depth,
+          gloom: rand(0, 0.15),
+          seed: rand(0, 99999),
+          baseOpacity: rand(0.8, 1.0),
+          fadeSpeed: rand(0.0005, 0.002),
+        });
+        foregroundClouds.push(c);
+      }
+      foregroundClouds.sort((a, b) => a.depth - b.depth);
+
+      // combine all clouds for update/draw order
+      const allClouds = [...overcastClouds, ...midClouds, ...foregroundClouds];
+
+      // --------------------------------------------------------------
+      //  RENDER LOOP
+      // --------------------------------------------------------------
+      let time = 0;
+
+      function render() {
+        time += 0.01;
+
+        const now = new Date();
+        const hour = now.getHours() + now.getMinutes() / 60 + now.getSeconds() / 3600;
+        const dayBlend = clamp(Math.cos(((hour - 12) / 6) * (Math.PI / 2)), 0, 1);
+        const nightBlend = 1 - dayBlend;
+
+        const skyHue = lerp(220, 205, dayBlend);
+        const skySat = lerp(24, 55, dayBlend);
+        const skyLight = lerp(18, 70, dayBlend) + Math.sin(time * 0.003) * 3;
+        const grad = ctx.createRadialGradient(
+          W * 0.5, H * 0.85, 100,
+          W * 0.5, H * 0.85, Math.max(W, H) * 1.3
+        );
+        grad.addColorStop(0, `hsl(${skyHue}, ${skySat}%, ${Math.min(92, skyLight + 10)}%)`);
+        grad.addColorStop(0.5, `hsl(${skyHue - 5}, ${Math.max(20, skySat - 5)}%, ${Math.max(15, skyLight - 5)}%)`);
+        grad.addColorStop(1, `hsl(${skyHue - 15}, ${Math.max(14, skySat - 15)}%, ${Math.max(6, skyLight - 25)}%)`);
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+
+        // --- draw all clouds (layered by depth) ---
+        // we already sorted them, but we need to update first
+        for (const c of allClouds) {
+          c.update(time);
+        }
+
+        // draw each layer separately to maintain depth order
+        // overcast first
+        for (const c of overcastClouds) {
+          c.draw(ctx, time, true);
+        }
+        // mid
+        for (const c of midClouds) {
+          c.draw(ctx, time, false);
+        }
+        // foreground
+        for (const c of foregroundClouds) {
+          c.draw(ctx, time, false);
+        }
+
+        // --- atmospheric haze (softens edges) ---
+        const haze = ctx.createLinearGradient(0, 0, 0, H);
+        haze.addColorStop(0, 'rgba(255,255,245,0.03)');
+        haze.addColorStop(0.5, 'rgba(255,255,245,0.01)');
+        haze.addColorStop(1, 'rgba(0,0,10,0.08)');
+        ctx.fillStyle = haze;
+        ctx.fillRect(0, 0, W, H);
+
+        // subtle sun glow (optional) – just a soft warm spot
+        const sunX = W * 0.7 + Math.sin(time * 0.001) * 100;
+        const sunY = H * 0.15;
+        const sunGrad = ctx.createRadialGradient(sunX, sunY, 10, sunX, sunY, 400);
+        sunGrad.addColorStop(0, 'rgba(255,220,150,0.04)');
+        sunGrad.addColorStop(1, 'rgba(255,220,150,0)');
+        ctx.fillStyle = sunGrad;
+        ctx.fillRect(0, 0, W, H);
+
+        // --- draw foreground textures on top of clouds ---
+        if (nightSky.complete || daySky.complete) {
+          ctx.globalAlpha = 1;
+          if (daySky.complete) {
+            ctx.globalAlpha = dayBlend;
+            ctx.drawImage(daySky, -Math.sin(time * 0.0007) * 18, 0, W * 1.05, H);
+          }
+          if (nightSky.complete) {
+            ctx.globalAlpha = nightBlend;
+            ctx.drawImage(nightSky, Math.sin(time * 0.0009) * 24, 0, W * 1.05, H);
+          }
+          ctx.globalAlpha = 1;
+        }
+
+        requestAnimationFrame(render);
+      }
+
+      // --------------------------------------------------------------
+      //  RESIZE HANDLER
+      // --------------------------------------------------------------
+      let resizeTimeout;
+
+      function handleResize() {
+        clearTimeout(resizeTimeout);
+        resizeTimeout = setTimeout(() => {
+          const oldW = W,
+            oldH = H;
+          resize();
+          const sx = W / oldW;
+          const sy = H / oldH;
+          for (const c of allClouds) {
+            c.x *= sx;
+            c.y *= sy;
+            c.baseY = c.y;
+            c.scale *= (sx + sy) / 2;
+            // regenerate blobs with new scale
+            c.blobs = generateCloudBlobs(0, 0, c.scale, c.seed, c.gloom);
+          }
+        }, 200);
+      }
+      window.addEventListener('resize', handleResize);
+
+      // --------------------------------------------------------------
+      //  START
+      // --------------------------------------------------------------
+      render();
+
+      console.log('🌤️ Cinematic sky with fading cloud layers');
+    })();
+  </script>
+</body>
+</html>
